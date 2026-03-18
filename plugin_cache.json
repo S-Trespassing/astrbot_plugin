@@ -7,7 +7,7 @@
     "tags": [],
     "stars": 0,
     "version": "v1.2.0",
-    "updated_at": "2026-03-18T09:17:26+08:00",
+    "updated_at": "2026-03-18T13:37:25+08:00",
     "astrbot_version": ">=4.13.0,<5",
     "support_platforms": [
       "aiocqhttp"
