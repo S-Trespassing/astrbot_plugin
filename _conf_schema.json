@@ -26,7 +26,7 @@
   "anti_bot_verify_timeout_seconds": {
     "description": "验证码有效期（秒）",
     "type": "int",
-    "hint": "私聊验证码的有效时间，建议不要超过禁言时长。",
+    "hint": "私聊验证码的有效时间；超时未完成验证会自动静默踢出群聊，建议不要超过禁言时长。",
     "default": 300
   },
   "monitor_groups": {
@@ -81,5 +81,23 @@
     "type": "bool",
     "hint": "命中监控后，是否将告警转发到对应的告警群。",
     "default": true
+  },
+  "update_repo_url": {
+    "description": "插件更新仓库地址",
+    "type": "string",
+    "hint": "填写 GitHub 仓库 HTTPS 地址，/更新群管理插件 会从这里拉取最新代码。",
+    "default": ""
+  },
+  "update_branch": {
+    "description": "插件更新分支",
+    "type": "string",
+    "hint": "默认 main，也可以改成 master 或你自己的发布分支。",
+    "default": "main"
+  },
+  "update_github_token": {
+    "description": "GitHub Token（可选）",
+    "type": "string",
+    "hint": "私有仓库或需要提高 GitHub API 频率限制时可填写。",
+    "default": ""
   }
 }

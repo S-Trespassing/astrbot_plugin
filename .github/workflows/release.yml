@@ -1,0 +1,59 @@
+name: Build Release Package
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Read plugin metadata
+        id: metadata
+        shell: bash
+        run: |
+          plugin_name="$(grep '^name:' metadata.yaml | head -n 1 | cut -d':' -f2- | xargs)"
+          plugin_version="$(grep '^version:' metadata.yaml | head -n 1 | cut -d':' -f2- | xargs)"
+          echo "plugin_name=${plugin_name}" >> "$GITHUB_OUTPUT"
+          echo "plugin_version=${plugin_version}" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure tag matches metadata version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          if [ "${GITHUB_REF_NAME}" != "${{ steps.metadata.outputs.plugin_version }}" ]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match metadata version ${{ steps.metadata.outputs.plugin_version }}"
+            exit 1
+          fi
+
+      - name: Build plugin zip
+        run: python pack_plugin.py
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.metadata.outputs.plugin_name }}-${{ steps.metadata.outputs.plugin_version }}
+          path: dist/${{ steps.metadata.outputs.plugin_name }}.zip
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ steps.metadata.outputs.plugin_version }}
+          files: dist/${{ steps.metadata.outputs.plugin_name }}.zip
+          generate_release_notes: true

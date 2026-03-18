@@ -63,6 +63,20 @@ class AntiBotService:
     def _save(self) -> None:
         self.storage.save(self.data)
 
+    def _build_record(
+        self,
+        user_id: str,
+        record: dict[str, Any],
+    ) -> ChallengeRecord:
+        return ChallengeRecord(
+            user_id=user_id,
+            group_id=str(record["group_id"]),
+            code=str(record["code"]),
+            created_at=self._safe_int(record.get("created_at")) or 0,
+            expires_at=self._safe_int(record.get("expires_at")) or 0,
+            mute_duration=self._safe_int(record.get("mute_duration")) or 0,
+        )
+
     def _purge_expired(self, now: int | None = None) -> None:
         now = now or int(time.time())
         changed = False
@@ -125,17 +139,19 @@ class AntiBotService:
     ) -> list[ChallengeRecord]:
         self._purge_expired(now)
         records = self.data.get(user_id, [])
-        return [
-            ChallengeRecord(
-                user_id=user_id,
-                group_id=str(record["group_id"]),
-                code=str(record["code"]),
-                created_at=self._safe_int(record.get("created_at")) or 0,
-                expires_at=self._safe_int(record.get("expires_at")) or 0,
-                mute_duration=self._safe_int(record.get("mute_duration")) or 0,
-            )
-            for record in records
-        ]
+        return [self._build_record(user_id, record) for record in records]
+
+    def list_records(self) -> list[ChallengeRecord]:
+        records: list[ChallengeRecord] = []
+        for user_id, user_records in self.data.items():
+            records.extend(self._build_record(user_id, record) for record in user_records)
+        return records
+
+    def get_record(self, user_id: str, group_id: str) -> ChallengeRecord | None:
+        for record in self.data.get(user_id, []):
+            if str(record.get("group_id", "")) == group_id:
+                return self._build_record(user_id, record)
+        return None
 
     def verify_code(
         self,
@@ -159,14 +175,7 @@ class AntiBotService:
         records = self.data.get(user_id, [])
         for record in records:
             if str(record.get("code", "")) == code:
-                return ChallengeRecord(
-                    user_id=user_id,
-                    group_id=str(record["group_id"]),
-                    code=str(record["code"]),
-                    created_at=self._safe_int(record.get("created_at")) or 0,
-                    expires_at=self._safe_int(record.get("expires_at")) or 0,
-                    mute_duration=self._safe_int(record.get("mute_duration")) or 0,
-                )
+                return self._build_record(user_id, record)
         return None
 
     def confirm_challenge(self, user_id: str, group_id: str) -> None:
@@ -363,9 +372,10 @@ class AntiBotService:
         except OSError:
             pass
 
-    def cleanup_stale_files(self) -> None:
+    def cleanup_stale_files(self, purge_expired: bool = True) -> None:
         now = int(time.time())
-        self._purge_expired(now)
+        if purge_expired:
+            self._purge_expired(now)
         for file_path in self.temp_dir.glob("captcha_*.png"):
             try:
                 if math.floor(file_path.stat().st_mtime) + 86400 < now:

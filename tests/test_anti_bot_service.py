@@ -64,6 +64,30 @@ class AntiBotServiceTest(unittest.TestCase):
 
         self.assertEqual(self.service.get_pending_records("10001", now=161), [])
 
+    def test_get_record_and_list_records(self) -> None:
+        self.service.create_challenge(
+            user_id="10001",
+            group_id="20001",
+            mute_duration=1800,
+            ttl_seconds=1800,
+            now=100,
+        )
+        self.service.create_challenge(
+            user_id="10001",
+            group_id="20002",
+            mute_duration=1800,
+            ttl_seconds=1800,
+            now=101,
+        )
+
+        record = self.service.get_record("10001", "20002")
+        self.assertIsNotNone(record)
+        self.assertEqual(record.group_id if record else None, "20002")
+        self.assertEqual(
+            sorted(item.group_id for item in self.service.list_records()),
+            ["20001", "20002"],
+        )
+
     def test_generate_captcha_image_creates_file(self) -> None:
         file_path = self.service.generate_captcha_image("274222")
         self.assertTrue(file_path.exists())

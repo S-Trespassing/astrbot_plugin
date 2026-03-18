@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from pathlib import Path
 from typing import Any
 
 from astrbot.api import logger
@@ -10,14 +11,16 @@ from astrbot.api.message_components import At
 from astrbot.api.star import Context, Star, StarTools, register
 
 try:
-    from .services.anti_bot import AntiBotService
+    from .services.anti_bot import AntiBotService, ChallengeRecord
     from .services.invite_tree import InviteTreeService
     from .services.monitor import MonitorService, ViolationRecord
+    from .services.self_update import SelfUpdateError, SelfUpdateService
     from .services.storage import JsonStorage
 except ImportError:
-    from services.anti_bot import AntiBotService
+    from services.anti_bot import AntiBotService, ChallengeRecord
     from services.invite_tree import InviteTreeService
     from services.monitor import MonitorService, ViolationRecord
+    from services.self_update import SelfUpdateError, SelfUpdateService
     from services.storage import JsonStorage
 
 PLUGIN_NAME = "astrbot_plugin_group_manage"
@@ -42,16 +45,21 @@ def _raw_get(obj: Any, key: str, default: Any = None) -> Any:
     PLUGIN_NAME,
     "Codex",
     "群管理插件，支持邀请树、二维码监控与入群防机器人验证",
-    "1.1.0",
+    "1.2.0",
 )
 class GroupManagePlugin(Star):
     def __init__(self, context: Context, config: dict | None = None) -> None:
         super().__init__(context, config)
         self.config = config or {}
         plugin_name = getattr(self, "name", PLUGIN_NAME)
+        self.plugin_dir = Path(__file__).resolve().parent
         self.data_dir = StarTools.get_data_dir(plugin_name)
         self.temp_dir = self.data_dir / "temp"
         self.temp_dir.mkdir(parents=True, exist_ok=True)
+        self.update_lock = asyncio.Lock()
+        self._anti_bot_timeout_tasks: dict[tuple[str, str], asyncio.Task[Any]] = {}
+        self._anti_bot_runtime_bot: Any | None = None
+        self._anti_bot_timeout_restore_finished = False
         self.invite_tree_service = InviteTreeService(
             JsonStorage(self.data_dir, "invite_tree.json")
         )
@@ -60,19 +68,29 @@ class GroupManagePlugin(Star):
             JsonStorage(self.data_dir, "anti_bot.json"),
             self.temp_dir,
         )
+        self.self_update_service = SelfUpdateService(
+            plugin_dir=self.plugin_dir,
+            temp_dir=self.temp_dir,
+            storage=JsonStorage(self.data_dir, "self_update.json"),
+        )
 
     async def initialize(self) -> None:
-        self.anti_bot_service.cleanup_stale_files()
+        self.anti_bot_service.cleanup_stale_files(purge_expired=False)
+        self.self_update_service.cleanup_stale_files()
         logger.info("群管理插件已初始化，数据目录: %s", self.data_dir)
 
     async def terminate(self) -> None:
+        await self._cancel_all_anti_bot_timeout_tasks()
         self.monitor_service.cleanup_stale_files()
-        self.anti_bot_service.cleanup_stale_files()
+        self.anti_bot_service.cleanup_stale_files(purge_expired=False)
+        self.self_update_service.cleanup_stale_files()
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def handle_group_event(self, event: AstrMessageEvent) -> None:
         if event.get_platform_name() != SUPPORTED_PLATFORM:
             return
+        self._remember_anti_bot_bot(event)
+        await self._restore_anti_bot_timeout_tasks()
 
         raw_message = getattr(event.message_obj, "raw_message", None)
         post_type = _raw_get(raw_message, "post_type", "")
@@ -86,6 +104,8 @@ class GroupManagePlugin(Star):
     async def handle_private_event(self, event: AstrMessageEvent) -> None:
         if event.get_platform_name() != SUPPORTED_PLATFORM:
             return
+        self._remember_anti_bot_bot(event)
+        await self._restore_anti_bot_timeout_tasks()
         await self._handle_private_verification(event)
 
     @filter.command("开启邀请树")
@@ -313,7 +333,7 @@ class GroupManagePlugin(Star):
             "📋 当前开启防机器人验证的群：",
             *[f"- {group_id}" for group_id in enabled_groups],
             f"⏱ 禁言时长：{mute_duration} 秒",
-            f"⌛ 验证有效期：{verify_timeout} 秒",
+            f"⌛ 验证有效期：{verify_timeout} 秒（超时自动静默踢出）",
         ]
         yield self._stop_text("\n".join(content))
 
@@ -448,6 +468,128 @@ class GroupManagePlugin(Star):
         content.extend(f"- {user_id}" for user_id in whitelist)
         yield self._stop_text("\n".join(content))
 
+    @filter.command("设置更新仓库")
+    async def set_update_repo(self, event: AstrMessageEvent):
+        """设置插件自更新使用的 GitHub 仓库地址和分支。"""
+        error = self._ensure_superuser_result(event)
+        if error is not None:
+            yield error
+            return
+
+        payload = self._extract_command_payload(event, "设置更新仓库")
+        if not payload:
+            yield self._stop_text(
+                "⚠️ 用法：/设置更新仓库 <GitHub仓库地址> [分支]\n"
+                "示例：/设置更新仓库 https://github.com/yourname/astrbot_plugin_group_manage main"
+            )
+            return
+
+        parts = payload.split()
+        repo_url = self.self_update_service.normalize_repo_url(parts[0])
+        if not repo_url:
+            yield self._stop_text("⚠️ 仅支持 GitHub 仓库地址，请填写 https://github.com/用户名/仓库名。")
+            return
+
+        branch = (parts[1].strip() if len(parts) > 1 else "") or "main"
+        self._save_cfg_value("update_repo_url", repo_url)
+        self._save_cfg_value("update_branch", branch)
+        yield self._stop_text(
+            "✅ 已保存插件更新配置。\n"
+            f"🔗 仓库：{repo_url}\n"
+            f"🌿 分支：{branch}"
+        )
+
+    @filter.command("查看更新配置")
+    async def show_update_config(self, event: AstrMessageEvent):
+        """查看插件自更新配置。"""
+        error = self._ensure_superuser_result(event)
+        if error is not None:
+            yield error
+            return
+
+        repo_url = self._resolve_update_repo_url()
+        branch = self._resolve_update_branch()
+        install_mode = "Git 仓库" if self.self_update_service.is_git_repo() else "GitHub 压缩包"
+        content = [
+            "📋 当前插件更新配置：",
+            f"🔧 更新方式：{install_mode}",
+            f"🔗 仓库：{repo_url or '未配置'}",
+            f"🌿 分支：{branch}",
+        ]
+        if not repo_url:
+            content.append("⚠️ 还没有配置更新仓库，请先执行 /设置更新仓库。")
+        yield self._stop_text("\n".join(content))
+
+    @filter.command("更新群管理插件")
+    async def update_plugin_from_github(self, event: AstrMessageEvent):
+        """从 GitHub 拉取最新插件代码并自动重载。"""
+        error = self._ensure_superuser_result(event)
+        if error is not None:
+            yield error
+            return
+
+        repo_url = self._resolve_update_repo_url()
+        if not repo_url:
+            yield self._stop_text(
+                "⚠️ 还没有配置更新仓库，请先执行 /设置更新仓库 <GitHub仓库地址> [分支]。"
+            )
+            return
+
+        if self.update_lock.locked():
+            yield self._stop_text("⚠️ 当前已经有一次插件更新正在执行，请稍后再试。")
+            return
+
+        branch = self._resolve_update_branch()
+        github_token = self._cfg_str("update_github_token", "")
+        await self._send_text_message(event, "🔄 正在从 GitHub 拉取群管理插件更新，请稍候...")
+
+        async with self.update_lock:
+            try:
+                result = await self.self_update_service.update_from_github(
+                    repo_url=repo_url,
+                    branch=branch,
+                    github_token=github_token,
+                )
+            except SelfUpdateError as exc:
+                yield self._stop_text(f"❌ 插件更新失败：{exc}")
+                return
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("插件自动更新失败")
+                yield self._stop_text(f"❌ 插件更新失败：{exc}")
+                return
+
+        if not result.changed:
+            yield self._stop_text(
+                "✅ 当前已经是最新版本，无需更新。\n"
+                f"🔗 仓库：{result.repo_url}\n"
+                f"🌿 分支：{result.branch}\n"
+                f"🧾 提交：{(result.commit or '未知')[:7]}"
+            )
+            return
+
+        star_manager = getattr(self.context, "_star_manager", None)
+        auto_reload_enabled = star_manager is not None
+        summary_lines = [
+            "✅ 已拉取到群管理插件最新版本。",
+            f"🔗 仓库：{result.repo_url}",
+            f"🌿 分支：{result.branch}",
+            f"🧾 提交：{(result.commit or '未知')[:7]}",
+        ]
+        if result.mode == "archive":
+            summary_lines.append(
+                f"📦 覆盖文件：{result.copied_files}，清理旧文件：{result.removed_files}"
+            )
+        if auto_reload_enabled:
+            summary_lines.append("♻️ 即将自动重载插件，通常几秒内生效。")
+            summary_lines.append("如果没有自动生效，请到 AstrBot 插件管理页手动重载一次。")
+        else:
+            summary_lines.append("⚠️ 当前环境未暴露自动重载接口，请到 AstrBot 插件管理页手动重载。")
+
+        await self._send_text_message(event, "\n".join(summary_lines))
+        if auto_reload_enabled:
+            asyncio.create_task(self._reload_self_after_delay())
+        yield MessageEventResult().stop_event()
+
     async def _handle_group_notice(
         self,
         event: AstrMessageEvent,
@@ -464,13 +606,17 @@ class GroupManagePlugin(Star):
         if user_id == self._normalized_id(_raw_get(raw_message, "self_id")):
             return
 
-        if group_id in self._id_list(self._cfg("anti_bot_enabled_groups", [])):
+        sub_type = _raw_get(raw_message, "sub_type", "")
+        # 邀请入群需要记录邀请树，不应被防机器人流程拦截。
+        if (
+            sub_type != "invite"
+            and group_id in self._id_list(self._cfg("anti_bot_enabled_groups", []))
+        ):
             await self._handle_anti_bot_group_increase(event, group_id, user_id)
 
         if group_id not in self._id_list(self._cfg("invite_tree_enabled_groups", [])):
             return
 
-        sub_type = _raw_get(raw_message, "sub_type", "")
         operator_id = self._normalized_id(_raw_get(raw_message, "operator_id"))
         inviter_id = operator_id if sub_type == "invite" and operator_id != user_id else None
         inviter_role = ""
@@ -529,24 +675,26 @@ class GroupManagePlugin(Star):
             mute_duration=mute_duration,
             ttl_seconds=verify_timeout,
         )
+        self._schedule_anti_bot_timeout(challenge, bot)
 
         captcha_path = None
-        group_notice_sent = False
         private_notice_sent = False
+        group_notice_sent = False
         try:
             captcha_path = self.anti_bot_service.generate_captcha_image(challenge.code)
-            group_notice_sent = await self._send_anti_bot_group_notice(
-                event,
-                group_id,
-                user_id,
-                captcha_path,
-                verify_timeout,
-            )
             private_notice_sent = await self._send_anti_bot_private_notice(
                 user_id,
                 captcha_path,
                 verify_timeout,
             )
+            if not private_notice_sent:
+                group_notice_sent = await self._send_anti_bot_group_notice(
+                    event,
+                    group_id,
+                    user_id,
+                    captcha_path,
+                    verify_timeout,
+                )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "发送入群验证码失败 group=%s user=%s error=%s",
@@ -557,18 +705,14 @@ class GroupManagePlugin(Star):
         finally:
             self.anti_bot_service.cleanup_file(captcha_path)
 
-        if group_notice_sent or private_notice_sent:
+        if private_notice_sent:
             return
 
-        self.anti_bot_service.remove_challenge(user_id, group_id)
-        try:
-            await self._unmute_user(bot, group_id, user_id)
-        except Exception as exc:  # noqa: BLE001
+        if not group_notice_sent:
             logger.warning(
-                "入群验证码发送失败后的回滚解禁失败 group=%s user=%s error=%s",
+                "私聊验证码发送失败，且群内兜底通知也发送失败 group=%s user=%s",
                 group_id,
                 user_id,
-                exc,
             )
 
     async def _send_anti_bot_group_notice(
@@ -579,12 +723,12 @@ class GroupManagePlugin(Star):
         captcha_path: Any,
         verify_timeout: int,
     ) -> bool:
+        minutes = max(1, verify_timeout // 60)
         chain = MessageChain()
         chain.at(user_id, user_id).message(
-            " \n"
-            "🔔 【入群验证提醒】\n"
-            "请先阅读下方图片内容，完成验证。\n"
-            "⏰ 限时：5 分钟"
+            " 私聊验证码发送失败，请点击机器人头像主动发起私聊。"
+            "然后只发送下方图片中的 6 位数字验证码。"
+            f"验证码约 {minutes} 分钟内有效。"
         )
         chain.file_image(str(captcha_path))
         try:
@@ -592,7 +736,7 @@ class GroupManagePlugin(Star):
             return True
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "群内发送验证码提示失败 group=%s user=%s error=%s",
+                "群内发送验证码兜底通知失败 group=%s user=%s error=%s",
                 group_id,
                 user_id,
                 exc,
@@ -670,6 +814,8 @@ class GroupManagePlugin(Star):
             event.stop_event()
             return
 
+        self._cancel_anti_bot_timeout_task(sender_id, matched.group_id)
+        self.anti_bot_service.confirm_challenge(sender_id, matched.group_id)
         try:
             await self._unmute_user(bot, matched.group_id, matched.user_id)
         except Exception as exc:  # noqa: BLE001
@@ -687,7 +833,6 @@ class GroupManagePlugin(Star):
             event.stop_event()
             return
 
-        self.anti_bot_service.confirm_challenge(sender_id, matched.group_id)
         await event.send(
             MessageChain().message(
                 f"验证通过，已自动解除你在群 {matched.group_id} 的禁言。"
@@ -890,6 +1035,129 @@ class GroupManagePlugin(Star):
             return ""
         return str(_raw_get(info, "role", "") or "")
 
+    def _remember_anti_bot_bot(self, event: AstrMessageEvent) -> None:
+        bot = getattr(event, "bot", None)
+        if bot is not None:
+            self._anti_bot_runtime_bot = bot
+
+    async def _restore_anti_bot_timeout_tasks(self) -> None:
+        if self._anti_bot_timeout_restore_finished:
+            return
+
+        bot = self._anti_bot_runtime_bot
+        if bot is None:
+            return
+
+        for challenge in self.anti_bot_service.list_records():
+            self._schedule_anti_bot_timeout(challenge, bot)
+        self._anti_bot_timeout_restore_finished = True
+
+    def _schedule_anti_bot_timeout(
+        self,
+        challenge: ChallengeRecord,
+        bot: Any,
+    ) -> None:
+        task_key = self._anti_bot_task_key(challenge.user_id, challenge.group_id)
+        existing_task = self._anti_bot_timeout_tasks.get(task_key)
+        if existing_task is not None:
+            existing_task.cancel()
+
+        task = asyncio.create_task(
+            self._kick_user_if_anti_bot_timeout(bot, challenge)
+        )
+        self._anti_bot_timeout_tasks[task_key] = task
+        task.add_done_callback(
+            lambda done_task, current_key=task_key: self._finalize_anti_bot_timeout_task(
+                current_key,
+                done_task,
+            )
+        )
+
+    def _cancel_anti_bot_timeout_task(self, user_id: str, group_id: str) -> None:
+        task = self._anti_bot_timeout_tasks.pop(
+            self._anti_bot_task_key(user_id, group_id),
+            None,
+        )
+        if task is not None:
+            task.cancel()
+
+    async def _cancel_all_anti_bot_timeout_tasks(self) -> None:
+        tasks = list(self._anti_bot_timeout_tasks.values())
+        self._anti_bot_timeout_tasks.clear()
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    def _finalize_anti_bot_timeout_task(
+        self,
+        task_key: tuple[str, str],
+        task: asyncio.Task[Any],
+    ) -> None:
+        if self._anti_bot_timeout_tasks.get(task_key) is task:
+            self._anti_bot_timeout_tasks.pop(task_key, None)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error("防机器人超时任务执行异常: %s", exc)
+
+    async def _kick_user_if_anti_bot_timeout(
+        self,
+        bot: Any,
+        challenge: ChallengeRecord,
+    ) -> None:
+        delay_seconds = max(0, challenge.expires_at - int(time.time()))
+        if delay_seconds > 0:
+            await asyncio.sleep(delay_seconds)
+
+        current = self.anti_bot_service.get_record(
+            challenge.user_id,
+            challenge.group_id,
+        )
+        if current is None:
+            return
+
+        kicked = await self._kick_user_silently(
+            bot,
+            current.group_id,
+            current.user_id,
+            reason="入群验证码超时自动踢出",
+        )
+        if not kicked:
+            return
+
+        self.anti_bot_service.remove_challenge(current.user_id, current.group_id)
+        self.invite_tree_service.delete_users(current.group_id, [current.user_id])
+
+    async def _kick_user_silently(
+        self,
+        bot: Any,
+        group_id: str,
+        user_id: str,
+        reason: str,
+    ) -> bool:
+        try:
+            await bot.call_action(
+                "set_group_kick",
+                group_id=int(group_id),
+                user_id=int(user_id),
+                reject_add_request=False,
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "%s失败 group=%s user=%s error=%s",
+                reason,
+                group_id,
+                user_id,
+                exc,
+            )
+            return False
+
+    def _anti_bot_task_key(self, user_id: str, group_id: str) -> tuple[str, str]:
+        return (user_id, group_id)
+
     async def _unmute_user(self, bot: Any, group_id: str, user_id: str) -> None:
         await bot.call_action(
             "set_group_ban",
@@ -922,11 +1190,85 @@ class GroupManagePlugin(Star):
         except (TypeError, ValueError):
             return default
 
+    def _cfg_str(self, key: str, default: str = "") -> str:
+        value = self._cfg(key, default)
+        if value is None:
+            return default
+        return str(value).strip()
+
     def _save_cfg_value(self, key: str, value: Any) -> None:
         self.config[key] = value
         save_config = getattr(self.config, "save_config", None)
         if callable(save_config):
             save_config()
+
+    def _ensure_superuser_result(
+        self,
+        event: AstrMessageEvent,
+    ) -> MessageEventResult | None:
+        if self._is_superuser(event):
+            return None
+        return self._stop_text("⚠️ 只有 AstrBot 管理员可以执行插件更新操作。")
+
+    def _extract_command_payload(
+        self,
+        event: AstrMessageEvent,
+        command_name: str,
+    ) -> str:
+        payload = (event.get_message_str() or "").strip()
+        for prefix in (f"/{command_name}", f"／{command_name}", command_name):
+            if payload.startswith(prefix):
+                return payload[len(prefix) :].strip()
+        return payload
+
+    def _resolve_update_repo_url(self) -> str:
+        configured_repo = self.self_update_service.normalize_repo_url(
+            self._cfg_str("update_repo_url", "")
+        )
+        if configured_repo:
+            return configured_repo
+
+        plugin_meta = self.context.get_registered_star(getattr(self, "name", PLUGIN_NAME))
+        metadata_repo = self.self_update_service.normalize_repo_url(
+            str(getattr(plugin_meta, "repo", "") or "")
+        )
+        if metadata_repo:
+            return metadata_repo
+
+        return self.self_update_service.detect_origin_repo()
+
+    def _resolve_update_branch(self) -> str:
+        configured_branch = self._cfg_str("update_branch", "")
+        if configured_branch:
+            return configured_branch
+        detected_branch = self.self_update_service.detect_current_branch()
+        return detected_branch or "main"
+
+    async def _send_text_message(
+        self,
+        event: AstrMessageEvent,
+        content: str,
+    ) -> None:
+        chain = MessageChain().message(content)
+        try:
+            await event.send(chain)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("发送插件更新提示失败 error=%s", exc)
+
+    async def _reload_self_after_delay(self, delay_seconds: float = 1.0) -> None:
+        await asyncio.sleep(delay_seconds)
+        star_manager = getattr(self.context, "_star_manager", None)
+        if star_manager is None:
+            logger.warning("当前上下文未暴露 StarManager，无法自动重载群管理插件。")
+            return
+        try:
+            success, error_message = await star_manager.reload(
+                getattr(self, "name", PLUGIN_NAME)
+            )
+            if not success:
+                logger.error("群管理插件自动重载失败：%s", error_message)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("群管理插件自动重载异常: %s", exc)
 
     def _stop_text(self, text: str) -> MessageEventResult:
         return MessageEventResult().message(text).stop_event()
