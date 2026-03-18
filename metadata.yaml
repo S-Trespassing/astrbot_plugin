@@ -1,0 +1,9 @@
+name: astrbot_plugin_group_manage
+display_name: 群管理
+desc: AstrBot 群管理插件，支持邀请树、QQ/微信群二维码监控与入群防机器人验证。
+version: v1.1.0
+author: Codex
+repo: ""
+support_platforms:
+  - aiocqhttp
+astrbot_version: ">=4.13.0,<5"

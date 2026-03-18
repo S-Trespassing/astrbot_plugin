@@ -1,0 +1,85 @@
+{
+  "invite_tree_enabled_groups": {
+    "description": "开启邀请树的群号列表",
+    "type": "list",
+    "items": {
+      "type": "string"
+    },
+    "hint": "填写需要记录邀请树的群号。",
+    "default": []
+  },
+  "anti_bot_enabled_groups": {
+    "description": "开启防机器人的群号列表",
+    "type": "list",
+    "items": {
+      "type": "string"
+    },
+    "hint": "这些群在有新成员加入时会先禁言并触发私聊验证码验证。",
+    "default": []
+  },
+  "anti_bot_mute_duration_seconds": {
+    "description": "防机器人禁言时长（秒）",
+    "type": "int",
+    "hint": "新成员在通过验证码前会被禁言这么久；通过验证后会立即解除。",
+    "default": 1800
+  },
+  "anti_bot_verify_timeout_seconds": {
+    "description": "验证码有效期（秒）",
+    "type": "int",
+    "hint": "私聊验证码的有效时间，建议不要超过禁言时长。",
+    "default": 300
+  },
+  "monitor_groups": {
+    "description": "群监控配置",
+    "type": "template_list",
+    "hint": "为每个源群配置一个告警群。",
+    "default": [],
+    "config_template": {
+      "group_id": "",
+      "alert_group_id": ""
+    },
+    "items": {
+      "group_id": {
+        "description": "源群号",
+        "type": "string"
+      },
+      "alert_group_id": {
+        "description": "告警群号",
+        "type": "string"
+      }
+    }
+  },
+  "whitelist_users": {
+    "description": "白名单用户",
+    "type": "list",
+    "items": {
+      "type": "string"
+    },
+    "hint": "白名单用户不会触发二维码监控，也不会作为受限邀请者挂入邀请树。",
+    "default": []
+  },
+  "skip_admins": {
+    "description": "跳过群主和管理员",
+    "type": "bool",
+    "hint": "开启后，群主和管理员发送二维码不会触发监控，管理员邀请也不会挂到邀请树上。",
+    "default": true
+  },
+  "delete_violation_message": {
+    "description": "撤回违规消息",
+    "type": "bool",
+    "hint": "命中二维码监控后，优先尝试撤回原消息。",
+    "default": true
+  },
+  "notify_group": {
+    "description": "群内提示",
+    "type": "bool",
+    "hint": "命中监控后，是否在源群发送处理提示。",
+    "default": true
+  },
+  "forward_alert": {
+    "description": "转发告警",
+    "type": "bool",
+    "hint": "命中监控后，是否将告警转发到对应的告警群。",
+    "default": true
+  }
+}
