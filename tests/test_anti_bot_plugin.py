@@ -230,7 +230,7 @@ class AntiBotPluginTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsNotNone(self.plugin.anti_bot_service.get_record("10001", "20001"))
 
-    async def test_invited_member_only_records_invite_tree(self) -> None:
+    async def test_invited_member_triggers_anti_bot_and_records_invite_tree(self) -> None:
         bot = _FakeBot()
         event = _FakeEvent(bot)
         anti_bot_calls: list[tuple[str, str]] = []
@@ -263,7 +263,7 @@ class AntiBotPluginTest(unittest.IsolatedAsyncioTestCase):
             },
         )
 
-        self.assertEqual(anti_bot_calls, [])
+        self.assertEqual(anti_bot_calls, [("20001", "10001")])
         self.assertEqual(len(recorded_invites), 1)
         self.assertEqual(recorded_invites[0]["group_id"], "20001")
         self.assertEqual(recorded_invites[0]["inviter_id"], "90001")

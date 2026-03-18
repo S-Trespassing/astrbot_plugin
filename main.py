@@ -607,11 +607,7 @@ class GroupManagePlugin(Star):
             return
 
         sub_type = _raw_get(raw_message, "sub_type", "")
-        # 邀请入群需要记录邀请树，不应被防机器人流程拦截。
-        if (
-            sub_type != "invite"
-            and group_id in self._id_list(self._cfg("anti_bot_enabled_groups", []))
-        ):
+        if group_id in self._id_list(self._cfg("anti_bot_enabled_groups", [])):
             await self._handle_anti_bot_group_increase(event, group_id, user_id)
 
         if group_id not in self._id_list(self._cfg("invite_tree_enabled_groups", [])):
